@@ -784,65 +784,98 @@ function parseFeeString(str){
   return str.split(',').map(s=>parseFloat(s.trim())).filter(n=>!isNaN(n)&&n>0).reduce((a,b)=>a+b,0);
 }
 function calculateLoanTotal(principal,fees=0,loanDateStr=null){
-  const maxDays=90;
-  let loanDate = loanDateStr ? new Date(loanDateStr) : new Date();
+  const r=0.015,n=3;
+  // Exact bKash EMI formula: EMI = (P*r*(1+r)^n) / ((1+r)^n - 1)
+  const emi=(principal*r*Math.pow(1+r,n))/(Math.pow(1+r,n)-1);
+  // bKash fixed rates
+  const fullInterest=principal*0.030823;
+  const processingFee=Math.round(principal*0.00575);
+  // totalRepayment = principal + fullInterest + processingFee + extraFees
+  const totalRepayment=principal+fullInterest+processingFee+fees;
+
+  // Generate exact EMI schedule using reducing balance method
+  // For each month: interest = remainingPrincipal * r
+  //                 principalPart = EMI - interest
+  //                 remainingPrincipal -= principalPart
+  let schedule=[];
+  let bal=principal;
+  for(let i=0;i<n;i++){
+    const monthInterest=bal*r;
+    const principalPart=emi-monthInterest;
+    const closingBal=Math.max(0,bal-principalPart);
+    schedule.push({
+      month:i+1,
+      interest:monthInterest,
+      principalPart,
+      emi,
+      openingBal:bal,
+      closingBal
+    });
+    bal=closingBal;
+  }
+
+  let loanDate=loanDateStr?new Date(loanDateStr):new Date();
   loanDate.setHours(0,0,0,0);
-  const now = new Date();
-  now.setHours(0,0,0,0);
-  const daysToCharge = Math.max(0, Math.min(maxDays, Math.floor((now - loanDate) / 86400000)));
-  
-  const r = 0.015;
-  const emi = (principal * r * Math.pow(1 + r, 3)) / (Math.pow(1 + r, 3) - 1);
-  const fullInterest = (emi * 3) - principal;
-  const processingFee = Math.round(principal * 0.00575);
-  const totalRepayment = principal + fullInterest + processingFee + fees;
-  
-  return {
-    interest: Math.round(fullInterest),
-    fullInterest: Math.round(fullInterest),
-    processingFee,
-    fees,
-    daysToCharge,
-    totalRepayment: Math.round(totalRepayment),
-    emi: Math.round(emi)
-  };
+  const now=new Date();now.setHours(0,0,0,0);
+  const daysToCharge=Math.max(0,Math.min(90,Math.floor((now-loanDate)/86400000)));
+
+  return{emi,fullInterest,processingFee,fees,daysToCharge,totalRepayment,schedule};
 }
 function getLoanBreakdown(p){
   const isLoan=p.loanData||p.history.some(h=>h.note.toLowerCase().includes('loan'));
   if(!isLoan)return null;
   const loanDate=p.loanData?.loanDate?new Date(p.loanData.loanDate):new Date(firstTs(p));
   const fees=p.loanData?.fees||0;
-  
-  const breakdown = calculateLoanTotal(p.original, fees, loanDate.toISOString().split('T')[0]);
-  const paidAmount = p.history.filter(h => h.t === 'pay').reduce((s, h) => s + h.amt, 0);
-  
-  // ১. দিন অনুযায়ী কারেন্ট ইন্টারেস্ট (Reducing Balance Schedule অনুযায়ী লাইভ কাউন্ট)
-  const monthsActive = Math.min(3, Math.ceil(breakdown.daysToCharge / 30) || 1);
-  let currentInterest = 0;
-  let tempPrincipal = p.original;
-  for (let i = 1; i <= monthsActive; i++) {
-    const monthInterest = Math.round(tempPrincipal * 0.015);
-    currentInterest += monthInterest;
-    // রিডিউসিং ট্র্যাকিং এর জন্য কাল্পনিক কিস্তি সমন্বয়
-    const estimatedEmi = Math.round(breakdown.totalRepayment / 3);
-    tempPrincipal = Math.max(0, tempPrincipal - (estimatedEmi - monthInterest));
+  const loanDateStr=loanDate.toISOString().split('T')[0];
+  const calc=calculateLoanTotal(p.original,fees,loanDateStr);
+
+  // Total paid so far (all payment entries)
+  const paidAmount=p.history.filter(h=>h.t==='pay').reduce((s,h)=>s+h.amt,0);
+
+  // Current interest accrued based on days passed (pro-rate over EMI schedule)
+  // Each month = 30 days; month interest from the schedule
+  const daysToCharge=calc.daysToCharge;
+  const monthsFullyDone=Math.floor(daysToCharge/30);
+  const daysInCurrentMonth=daysToCharge%30;
+
+  let currentInterest=0;
+  for(let i=0;i<Math.min(monthsFullyDone,3);i++){
+    currentInterest+=calc.schedule[i].interest;
   }
-  
-  // ২. পেমেন্ট ডিস্ট্রিবিউশন লজিক: আগে ইন্টারেস্ট কভার হবে, তারপর আসল কমবে
-  const interestCovered = Math.min(paidAmount, currentInterest);
-  const principalReduction = paidAmount - interestCovered;
-  const remainingPrincipal = Math.max(0, p.original - principalReduction);
-  
-  let progressPercent = 0;
-  if (breakdown.totalRepayment > 0) {
-    progressPercent = Math.min(100, Math.round((paidAmount / breakdown.totalRepayment) * 100));
+  if(monthsFullyDone<3&&daysInCurrentMonth>0){
+    const monthIdx=Math.min(monthsFullyDone,2);
+    currentInterest+=calc.schedule[monthIdx].interest*(daysInCurrentMonth/30);
   }
-  
-  return {
-    ...breakdown,
-    interest: currentInterest,
+  currentInterest=parseFloat(currentInterest.toFixed(2));
+
+  // Partial payment logic (exact bKash method):
+  // interestCovered = min(paidAmount, currentInterest)
+  // principalReduction = paidAmount - interestCovered
+  // remainingPrincipal = original - principalReduction
+  // remainingDue = totalRepayment - paidAmount
+  // paidPercent = (paidAmount / totalRepayment) * 100
+  const interestCovered=Math.min(paidAmount,currentInterest);
+  const principalReduction=Math.max(0,paidAmount-interestCovered);
+  const remainingPrincipal=Math.max(0,p.original-principalReduction);
+
+  const remainingDue=Math.max(0,calc.totalRepayment-paidAmount);
+  const progressPercent=calc.totalRepayment>0
+    ?Math.min(100,Math.round((paidAmount/calc.totalRepayment)*100)):0;
+
+  return{
+    emi:calc.emi,
+    fullInterest:calc.fullInterest,
+    processingFee:calc.processingFee,
+    fees:calc.fees,
+    daysToCharge:calc.daysToCharge,
+    totalRepayment:calc.totalRepayment,
+    schedule:calc.schedule,
+    interest:currentInterest,
+    interestCovered,
+    principalReduction,
     paidAmount,
     remainingPrincipal,
+    remainingDue,
     progressPercent
   };
 }
@@ -973,19 +1006,39 @@ function updateLoanCalcBreakdown(p){
   const newAmt=parseFloat(document.getElementById('ed-amt').value)||p.original;
   const fees=parseFeeString(document.getElementById('ed-fee').value);
   const loanDateStr=document.getElementById('ed-loan-date').value;
-  const breakdown=calculateLoanTotal(newAmt,fees,loanDateStr);
-  
+  const calc=calculateLoanTotal(newAmt,fees,loanDateStr);
+
+  const scheduleRows=calc.schedule.map(s=>`
+    <tr>
+      <td style="padding:4px 6px;text-align:center;">${s.month}</td>
+      <td style="padding:4px 6px;text-align:right;">৳${fmt(Math.round(s.openingBal))}</td>
+      <td style="padding:4px 6px;text-align:right;color:#f97316;">৳${fmt(Math.round(s.interest))}</td>
+      <td style="padding:4px 6px;text-align:right;color:var(--primary);">৳${fmt(Math.round(s.principalPart))}</td>
+      <td style="padding:4px 6px;text-align:right;font-weight:700;">৳${fmt(Math.round(s.emi))}</td>
+    </tr>`).join('');
+
   const html=`
     <div>💵 Principal: ৳${fmt(newAmt)}</div>
-    <div>📅 Days Passed: ${breakdown.daysToCharge}/90</div>
-    <div>⏳ Current Interest: ৳${fmt(breakdown.interest)}</div>
-    <div>📈 Amortized Max Interest: ৳${fmt(breakdown.fullInterest)}</div>
-    <div>⚙️ Processing Fee: ৳${fmt(breakdown.processingFee)}</div>
+    <div>📅 Days Passed: ${calc.daysToCharge}/90</div>
+    <div>📈 Full Interest (×0.030823): ৳${fmt(Math.round(calc.fullInterest))}</div>
+    <div>⚙️ Processing Fee (×0.00575): ৳${fmt(calc.processingFee)}</div>
     <div>💸 Extra Fees: ৳${fmt(fees)}</div>
-    <div style="margin-top:6px;padding-top:4px;border-top:1px dashed var(--border);color:var(--primary);font-weight:700;">🗓️ Target EMI: ৳${fmt(breakdown.emi)}/mo</div>
+    <div style="margin-top:8px;">
+      <div style="font-weight:700;color:var(--primary);margin-bottom:4px;">🗓️ EMI Schedule (Reducing Balance)</div>
+      <table style="width:100%;border-collapse:collapse;font-size:11px;">
+        <thead><tr style="color:var(--muted);">
+          <th style="padding:3px 6px;">Mo.</th>
+          <th style="padding:3px 6px;">Opening</th>
+          <th style="padding:3px 6px;">Interest</th>
+          <th style="padding:3px 6px;">Principal</th>
+          <th style="padding:3px 6px;">EMI</th>
+        </tr></thead>
+        <tbody>${scheduleRows}</tbody>
+      </table>
+    </div>
   `;
   document.getElementById('ed-calc-breakdown').innerHTML=html;
-  document.getElementById('ed-total-due').textContent=fmt(breakdown.totalRepayment);
+  document.getElementById('ed-total-due').textContent=fmt(Math.round(calc.totalRepayment));
 }
 function confirmEdit(){
   const amt=parseFloat(document.getElementById('ed-amt').value);
@@ -1067,24 +1120,31 @@ function renderCard(p,type){
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px;">
           <div>💵 Original Principal<br><span style="font-weight:700;font-size:13px;">৳${fmt(p.original)}</span></div>
-          <div>📉 Remaining Principal<br><span style="font-weight:700;color:var(--primary);font-size:13px;">৳${fmt(breakdown.remainingPrincipal)}</span></div>
-          <div>💰 Paid Amount<br><span style="font-weight:700;color:var(--green);font-size:13px;">৳${fmt(breakdown.paidAmount)}</span></div>
+          <div>📉 Remaining Principal<br><span style="font-weight:700;color:var(--primary);font-size:13px;">৳${fmt(Math.round(breakdown.remainingPrincipal))}</span></div>
+          <div>💰 Paid Amount<br><span style="font-weight:700;color:var(--green);font-size:13px;">৳${fmt(Math.round(breakdown.paidAmount))}</span></div>
           <div>⏳ Current Interest<br><span style="font-weight:700;color:#f97316;font-size:13px;">৳${fmt(breakdown.interest)}</span></div>
-          <div>📈 Full Interest<br><span style="font-weight:700;color:var(--muted);font-size:13px;">৳${fmt(breakdown.fullInterest)}</span></div>
+          <div>📈 Full Interest<br><span style="font-weight:700;color:var(--muted);font-size:13px;">৳${fmt(Math.round(breakdown.fullInterest))}</span></div>
           <div>⚙️ Processing Fee<br><span style="font-weight:700;color:var(--yellow);font-size:13px;">৳${fmt(breakdown.processingFee)}</span></div>
         </div>
-        
+
         <div style="border-top:1px solid var(--border);padding-top:6px;margin-top:4px;background:rgba(56,189,248,0.05);padding:6px;border-radius:6px;margin-bottom:6px;">
           <div style="display:flex;justify-content:space-between;font-weight:700;color:var(--primary);">
             <span>🗓️ Established EMI:</span>
-            <span>৳${fmt(breakdown.emi)} /mo</span>
+            <span>৳${fmt(Math.round(breakdown.emi))} /mo</span>
+          </div>
+        </div>
+
+        <div style="background:rgba(249,115,22,0.08);border-radius:6px;padding:6px;margin-bottom:6px;">
+          <div style="display:flex;justify-content:space-between;font-weight:700;color:#f97316;">
+            <span>⏳ Remaining Payable:</span>
+            <span style="font-size:14px;font-weight:900;">৳${fmt(Math.round(breakdown.remainingDue))}</span>
           </div>
         </div>
 
         <div style="border-top:1px solid var(--border);padding-top:6px;margin-top:6px;">
           <div style="display:flex;justify-content:space-between;font-weight:700;">
-            <span>Total Static Repayment:</span>
-            <span style="color:var(--green);font-size:14px;font-weight:900;">৳${fmt(breakdown.totalRepayment)}</span>
+            <span>Total Repayment:</span>
+            <span style="color:var(--green);font-size:14px;font-weight:900;">৳${fmt(Math.round(breakdown.totalRepayment))}</span>
           </div>
         </div>
       </div>`;
